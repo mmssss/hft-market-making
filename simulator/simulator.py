@@ -2,27 +2,66 @@ from dataclasses import dataclass
 from typing import Optional
 from collections import deque
 from queue import PriorityQueue
-from tqdm import tqdm
 import os
+import math
+
+from tqdm.auto import tqdm
 import pandas as pd
 
 # Note: all timestamps are in nanoseconds
 
 @dataclass
 class Order:
-    """ Our own placed order """
-    client_ts: int    # timestamp of when the order was created on the client timeline
-    exchange_ts: int  # when the order was created on the exchange
-    order_id: int
+    """
+    Attributes that are note Optional must be not None
+    otherwise ValueError is raised.
+    """
+    # Timestamp of when the order was created in the client time.
+    # It can be equal to `receive_ts` of the last update from the strategy
+    # returned by method `tick`, or it can be slightly greater,
+    # if you want to account for code execution time.
+    client_ts: int
+    # Timestamp of when the order was created on the exchange
+    exchange_ts: Optional[int]
+    # ID assigned by client to immideately keep track of the order
+    client_order_id: Optional[int]
+    # ID assigned by the exchange when the order is placed
+    order_id: Optional[int]
+    # Side of the trade ('BID' or 'ASK')
     side: str
     size: float
     price: float
 
+    def __post_init__(self):
+        if self.client_ts is None:
+            raise ValueError('`client_ts` is mandatory')
+        if self.side is None:
+            raise ValueError('`side` is mandatory')
+        if self.size is None:
+            raise ValueError('`size` is mandatory')
+        if self.price is None:
+            raise ValueError('`price` is mandatory')
+
+        if self.side != 'BID' and self.side != 'ASK':
+            raise ValueError('Side must be `BID` or `ASK`')
+        if self.size <= 0:
+            raise ValueError('Order size must be positive')
+        if self.price <= 0:
+            raise ValueError('Order price must be positive')
+
 
 @dataclass
 class CancelOrder:
-    """ A query to the simulator to cancel the order by id"""
-    timestamp: int
+    """A query to the simulator to cancel the order by id.
+
+    Attributes that are note Optional must be not None,
+    otherwise ValueError is raised.
+    """
+    # timestamp of when the order was created in the client time.
+    client_ts: int
+    # timestamp of when the order was created on the exchange
+    exchange_ts: Optional[int]
+    # exchange assigned ID of the order that needs to be canceled
     order_id: int
 
 
@@ -42,6 +81,7 @@ class OrderbookSnapshotUpdate:
     """ Orderbook tick snapshot """
     receive_ts:  int  # timestamp of when the data was received by client
     exchange_ts: int  # timestamp on the exchange timeline
+
     # Each element of the list is a `tuple[price, size]`.
     # First element of the list is the best level, second element
     # is the second best level, and so on.
@@ -69,28 +109,37 @@ class MdUpdate:
 class Strategy:
     def __init__(self, max_position: float) -> None:
         self.max_position = max_position
+        # client ID that will be assigned to the next created order
+        self.current_id = 1
+        self.orderbook = None
+        self.current_time = None
 
     def run(self, sim: 'ExchangeSimulator'):
         while True:
             try:
+                # TODO: consider that sim.tick() can also return Order, OwnTrade
                 md_update = sim.tick()
                 if md_update.orderbook is not None:
-                    orderbook = md_update.orderbook
-                    current_time = orderbook.receive_ts
-
-                    order = sim.place_order(current_time, 'BID', 0.001, orderbook.bids[0][0])
-                    # order = Order(current_time + 300, None, )
-                    break
-
+                    self.orderbook = md_update.orderbook
+                    self.current_time = self.orderbook.receive_ts
                 elif md_update.trade is not None:
                     trade = md_update.trade
-                    current_time = trade.receive_ts
+                    # TODO: update local version of the order book
+                    self.current_time = trade.receive_ts
+                if self.orderbook is None:
+                    continue
 
-                # call sim.place_order and sim.cancel_order here
-
+                order = Order(self.current_time + 20, None, self.get_current_id(), None,
+                              'BID', 0.001, self.orderbook.bids[0][0])
+                sim.place_order(order)
 
             except StopIteration:
                 break
+
+    def get_current_id(self):
+        cur_id = self.current_id
+        self.current_id += 1
+        return cur_id
 
 
 def load_md_from_files(lobs_path: str, trades_path: str) -> list[MdUpdate]:
@@ -181,7 +230,7 @@ class ExchangeSimulator:
        calculate the value of parameter `client_ts` (see `place_order` for details).
     """
     def __init__(self, lobs_path: str, trades_path: str,
-             exec_latency: float, md_latency: float) -> None:
+                 exec_latency: float, md_latency: float) -> None:
         """
         :param lobs_path: path to csv file which contains order book snapshots data
         :param trades_path: path to csv file which contains trades data
@@ -193,18 +242,39 @@ class ExchangeSimulator:
         if md_latency < 0:
             raise ValueError('Market data latency cannot be negative')
 
+        # execution latency
         self.exec_latency = exec_latency
+        # market data latency
         self.md_latency = md_latency
-        # market data
-        self.md = iter(load_md_from_files(lobs_path, trades_path))
-        # the ID that will be assigned to the next order created by user
+        # the ID that will be assigned to the next created order
         self.cur_order_id = 1
-        # the queue of strategy actions (used to simulate execution latency)
+        # market data queue
+        self.md_queue = load_md_from_files(lobs_path, trades_path)
+        # The queue of strategy actions, used to simulate execution latency.
+        # Possible types of objects inside the queue: `Order`, `CancelOrder`.
         self.actions_queue = deque()
         # queue for the data that is sent to the strategy
         self.strategy_updates_queue = PriorityQueue()
 
     def tick(self) -> MdUpdate:
+        if not self.md_queue:
+            event_time_md = math.inf
+        else:
+            md_update = self.md_queue[-1]
+            if md_update.orderbook is not None:
+                event_time_md = md_update.orderbook.exchange_ts
+            elif md_update.trade is not None:
+                event_time_md = md_update.trade.exchange_ts
+
+        if not self.actions_queue:
+            event_time_actions = math.inf
+        else:
+            event_time_actions = self.actions_queue[-1].client_ts
+
+        if not self.strategy_updates_queue:
+            event_time_strat_updates = 
+
+
         self._execute_orders()
         self._prepare_orders()
 
@@ -216,29 +286,17 @@ class ExchangeSimulator:
     def _prepare_orders(self):
         pass
 
-    def place_order(self, client_ts: int, side: str, size: float, price: float):
+    def place_order(self, order: 'Order'):
+        """Place order.
+        :param order: `Order` object. The following attributes MUST be initalized:
+            `client_ts`, `side`, `size`, `price`.
         """
-        :param client_ts: timestamp when the order was created in the client time.
-            It can be equal to `receive_ts` of the last update from the strategy
-            returned by method `tick`, or it can be slightly greater,
-            if you want to account for code execution time.
-        :param side: side of the trade ('BID' or 'ASK')
-        :param size:
-        :param price:
-        :return:
-        """
-        if side != 'BID' and side != 'ASK':
-            raise ValueError('Side of a trade must be `BID` or `ASK`')
-        if size <= 0:
-            raise ValueError('Order size must be positive')
-        if price <= 0:
-            raise ValueError('Order price must be positive')
-
-        order = Order(client_ts, None, self.cur_order_id, side, size, price)
         self.actions_queue.append(order)
 
-
-    def cancel_order(self):
+    def cancel_order(self, order_id):
+        """Cancel order by ID.
+        :param order_id: order ID assigned by the exchange when the order was placed
+        """
         pass
 
 
