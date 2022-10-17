@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 from collections import deque
 from queue import PriorityQueue
 import os
@@ -8,26 +8,44 @@ import math
 from tqdm.auto import tqdm
 import pandas as pd
 
-# Note: all timestamps are in nanoseconds
+
+"""Exchange simulator module.
+
+Note:
+    All timestamps are in nanoseconds.
+"""
+
 
 @dataclass
 class Order:
     """
-    Attributes that are note Optional must be not None
-    otherwise ValueError is raised.
+    Non-optional attributes must not be None, otherwise ValueError is raised.
+
+    Args:
+
+        client_ts:
+            Timestamp of when the order was created in the client time.
+            It can be equal to `receive_ts` of the last update from the strategy
+            returned by method `tick`, or it can be slightly greater,
+            if you want to account for code execution time.
+        exchange_ts:
+            Timestamp of when the order was created on the exchange
+        client_order_id: 
+            ID assigned by client. Can be used to immediately keep track of the order.
+        order_id:
+            ID assigned by the exchange when the order is placed
+        status: 
+            
+        side: 
+            Side of the trade ('BID' or 'ASK')
+        size: 
+        price:
     """
-    # Timestamp of when the order was created in the client time.
-    # It can be equal to `receive_ts` of the last update from the strategy
-    # returned by method `tick`, or it can be slightly greater,
-    # if you want to account for code execution time.
     client_ts: int
-    # Timestamp of when the order was created on the exchange
     exchange_ts: Optional[int]
-    # ID assigned by client to immideately keep track of the order
     client_order_id: Optional[int]
-    # ID assigned by the exchange when the order is placed
     order_id: Optional[int]
-    # Side of the trade ('BID' or 'ASK')
+    status: str
     side: str
     size: float
     price: float
@@ -54,20 +72,37 @@ class Order:
 class CancelOrder:
     """A query to the simulator to cancel the order by id.
 
-    Attributes that are note Optional must be not None,
-    otherwise ValueError is raised.
+    Non-optional attributes must not be `None`, otherwise `ValueError` is raised.
+    Either `client_order_id` or `order_id` must be provided.
+
+    Attributes:
+        
+        client_ts:
+            Timestamp of when the cancel was created in the client time.
+        exchange_ts:
+            Timestamp of when the cancel was registered on the exchange
+        client_order_id:
+            Client-assigned ID of the order that needs to be canceled.
+        order_id:
+            Exchange-assigned ID of the order that needs to be canceled.
+
     """
-    # timestamp of when the order was created in the client time.
     client_ts: int
-    # timestamp of when the order was created on the exchange
     exchange_ts: Optional[int]
-    # exchange assigned ID of the order that needs to be canceled
-    order_id: int
+    client_order_id: Optional[int]
+    order_id: Optional[int]
+
+    def __post_init__(self):
+        if self.client_ts is None:
+            raise ValueError('`client_ts is mandatory')
+        if self.client_order_id is None and self.order_id is None:
+            raise ValueError('Either `client_order_id` or `order_id` must be provided')
 
 
 @dataclass
 class OwnTrade:
-    """ Execution of own placed order """
+    """Execution of own placed order"""
+
     timestamp: int
     trade_id: int
     order_id: int
@@ -78,7 +113,7 @@ class OwnTrade:
 
 @dataclass
 class OrderbookSnapshotUpdate:
-    """ Orderbook tick snapshot """
+    """Orderbook tick snapshot"""
     receive_ts:  int  # timestamp of when the data was received by client
     exchange_ts: int  # timestamp on the exchange timeline
 
@@ -91,7 +126,7 @@ class OrderbookSnapshotUpdate:
 
 @dataclass
 class AnonTrade:
-    """ Market trade """
+    """Market trade"""
     receive_ts:  int  # timestamp of when the data was received by client
     exchange_ts: int  # timestamp on the exchange timeline
     side: str
@@ -101,7 +136,7 @@ class AnonTrade:
 
 @dataclass
 class MdUpdate:
-    """ Data of a tick """
+    """Data of a tick"""
     orderbook: Optional[OrderbookSnapshotUpdate] = None
     trade: Optional[AnonTrade] = None
 
@@ -213,7 +248,7 @@ def load_md_from_files(lobs_path: str, trades_path: str) -> list[MdUpdate]:
 
 
 class ExchangeSimulator:
-    """ Exchange simulator with order book and trades market data.
+    """Exchange simulator with order book and trades market data.
 
     This simulator must be used in the following way:
 
@@ -232,10 +267,11 @@ class ExchangeSimulator:
     def __init__(self, lobs_path: str, trades_path: str,
                  exec_latency: float, md_latency: float) -> None:
         """
-        :param lobs_path: path to csv file which contains order book snapshots data
-        :param trades_path: path to csv file which contains trades data
-        :param exec_latency: execution latency
-        :param md_latency: market data latency
+        Args:
+            lobs_path: path to csv file which contains order book snapshots data
+            trades_path: path to csv file which contains trades data
+            exec_latency: execution latency
+            md_latency: market data latency
         """
         if exec_latency < 0:
             raise ValueError('Execution latency cannot be negative')
@@ -251,12 +287,13 @@ class ExchangeSimulator:
         # market data queue
         self.md_queue = load_md_from_files(lobs_path, trades_path)
         # The queue of strategy actions, used to simulate execution latency.
-        # Possible types of objects inside the queue: `Order`, `CancelOrder`.
+        # Possible object types inside the queue: `Order`, `CancelOrder`.
         self.actions_queue = deque()
-        # queue for the data that is sent to the strategy
+        # Queue for the data that is sent to the strategy.
+        # Possible object types: `MdUpdate`, `Order`, `CancelOrder`, `OwnTrade`
         self.strategy_updates_queue = PriorityQueue()
 
-    def tick(self) -> MdUpdate:
+    def tick(self) -> Union[MdUpdate, Order, CancelOrder, OwnTrade]:
         if not self.md_queue:
             event_time_md = math.inf
         else:
@@ -287,8 +324,9 @@ class ExchangeSimulator:
         pass
 
     def place_order(self, order: 'Order'):
-        """Place order.
-        :param order: `Order` object. The following attributes MUST be initalized:
+        """
+        Args:
+            order: `Order` object. The following attributes MUST be initalized:
             `client_ts`, `side`, `size`, `price`.
         """
         self.actions_queue.append(order)
