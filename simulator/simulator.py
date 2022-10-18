@@ -29,20 +29,26 @@ class Order:
             returned by method `tick`, or it can be slightly greater,
             if you want to account for code execution time.
         exchange_ts:
-            Timestamp of when the order was created on the exchange
-        client_order_id: 
+            Timestamp of when the order was registered on the exchange simulator.
+            Filled in by the simulator.
+        receive_ts:
+            Timestamp of when the data was received by client. Exchange simulator
+            fills in this attribute, emulating latency.
+        client_order_id:
             ID assigned by client. Can be used to immediately keep track of the order.
         order_id:
-            ID assigned by the exchange when the order is placed
+            ID assigned by the exchange simulator when the order is placed.
+            Filled in by thh simulator.
         status: 
             
         side: 
-            Side of the trade ('BID' or 'ASK')
+            Side of the trade ('BID' or 'ASK').
         size: 
         price:
     """
     client_ts: int
     exchange_ts: Optional[int]
+    receive_ts: Optional[int]
     client_order_id: Optional[int]
     order_id: Optional[int]
     status: str
@@ -80,15 +86,20 @@ class CancelOrder:
         client_ts:
             Timestamp of when the cancel was created in the client time.
         exchange_ts:
-            Timestamp of when the cancel was registered on the exchange
+            Timestamp of when the cancel was registered on the exchange simulator.
+            Filled in by the simulator.
+        receive_ts:
+            Timestamp of when the data was received by client. Exchange simulator
+            fills in this attribute, emulating latency.
         client_order_id:
             Client-assigned ID of the order that needs to be canceled.
         order_id:
             Exchange-assigned ID of the order that needs to be canceled.
-
+            Filled in by the simulator.
     """
     client_ts: int
     exchange_ts: Optional[int]
+    receive_ts: Optional[int]
     client_order_id: Optional[int]
     order_id: Optional[int]
 
@@ -101,11 +112,34 @@ class CancelOrder:
 
 @dataclass
 class OwnTrade:
-    """Execution of own placed order"""
+    """Info about execution of an order placed by user of the simulator.
 
-    timestamp: int
-    trade_id: int
+    Objects of this class are created by the exchange simulator when the user
+    trades occur.
+
+    Attributes:
+        exchange_ts:
+            Timestamp of when the trade occured on the exchange simulator.
+        receive_ts:
+            Timestamp of when the data was received by client. Exchange simulator
+            fills in this attribute, emulating latency.
+        client_order_id:
+            Client-assigned ID of the order that has been executed.
+        order_id:
+            Exchange-assigned ID of the order that has been executed.
+        trade_id:
+
+        side:
+            Side of the trade ('BID' or 'ASK').
+        size:
+        price:
+
+    """
+    exchange_ts: int
+    receive_ts:  int
+    client_order_id: Optional[int]
     order_id: int
+    trade_id: int
     side: str
     size: float
     price: float
@@ -113,22 +147,46 @@ class OwnTrade:
 
 @dataclass
 class OrderbookSnapshotUpdate:
-    """Orderbook tick snapshot"""
-    receive_ts:  int  # timestamp of when the data was received by client
-    exchange_ts: int  # timestamp on the exchange timeline
+    """Orderbook tick snapshot.
 
-    # Each element of the list is a `tuple[price, size]`.
-    # First element of the list is the best level, second element
-    # is the second best level, and so on.
+    Attributes:
+        exchange_ts:
+            Timestamp in the exchange time (as recorded during the real-world
+            data collection)
+        receive_ts:
+            Timestamp of when the data was received by client (as recorded
+            during the real-world data collection)
+        asks:
+            Each element of the list is a `tuple[price, size]`.
+            First element of the list is the best level, second element
+            is the second-best level, and so on.
+        bids:
+            Same logic as for asks.
+    """
+    exchange_ts: int
+    receive_ts:  int
     asks: list[tuple[float, float]]
     bids: list[tuple[float, float]]
 
 
 @dataclass
 class AnonTrade:
-    """Market trade"""
-    receive_ts:  int  # timestamp of when the data was received by client
-    exchange_ts: int  # timestamp on the exchange timeline
+    """Market trade.
+
+    Attributes:
+        exchange_ts:
+            Timestamp in the exchange time (as recorded during the real-world
+            data collection).
+        receive_ts:
+            Timestamp of when the data was received by client (as recorded
+            during the real-world data collection).
+        side:
+            Side of the trade ('BID' or 'ASK').
+        size:
+        price:
+    """
+    exchange_ts: int
+    receive_ts:  int
     side: str
     size: float
     price: str
@@ -248,7 +306,7 @@ def load_md_from_files(lobs_path: str, trades_path: str) -> list[MdUpdate]:
 
 
 class ExchangeSimulator:
-    """Exchange simulator with order book and trades market data.
+    """Exchange simulator on order book level, with latencies emulation
 
     This simulator must be used in the following way:
 
@@ -264,6 +322,7 @@ class ExchangeSimulator:
        using `receive_ts` from the previous step as the current client time to
        calculate the value of parameter `client_ts` (see `place_order` for details).
     """
+
     def __init__(self, lobs_path: str, trades_path: str,
                  exec_latency: float, md_latency: float) -> None:
         """
@@ -285,37 +344,53 @@ class ExchangeSimulator:
         # the ID that will be assigned to the next created order
         self.cur_order_id = 1
         # market data queue
-        self.md_queue = load_md_from_files(lobs_path, trades_path)
+        self.md = load_md_from_files(lobs_path, trades_path)
         # The queue of strategy actions, used to simulate execution latency.
         # Possible object types inside the queue: `Order`, `CancelOrder`.
-        self.actions_queue = deque()
+        self.actions = deque()
         # Queue for the data that is sent to the strategy.
         # Possible object types: `MdUpdate`, `Order`, `CancelOrder`, `OwnTrade`
-        self.strategy_updates_queue = PriorityQueue()
+        self.strategy_updates = PriorityQueue()
 
     def tick(self) -> Union[MdUpdate, Order, CancelOrder, OwnTrade]:
-        if not self.md_queue:
-            event_time_md = math.inf
-        else:
-            md_update = self.md_queue[-1]
-            if md_update.orderbook is not None:
-                event_time_md = md_update.orderbook.exchange_ts
-            elif md_update.trade is not None:
-                event_time_md = md_update.trade.exchange_ts
-
-        if not self.actions_queue:
-            event_time_actions = math.inf
-        else:
-            event_time_actions = self.actions_queue[-1].client_ts
-
-        if not self.strategy_updates_queue:
-            event_time_strat_updates = 
-
 
         self._execute_orders()
         self._prepare_orders()
 
         # return next(self.md)
+
+    def _get_md_queue_event_time(self, md_queue):
+        if not md_queue:
+            event_time = math.inf
+        else:
+            md_update = md_queue[-1]
+            if md_update.orderbook is not None:
+                event_time = md_update.orderbook.exchange_ts
+            elif md_update.trade is not None:
+                event_time = md_update.trade.exchange_ts
+        return event_time
+
+    def _get_actions_queue_event_time(self, actions_queue):
+        if not actions_queue:
+            event_time = math.inf
+        else:
+            event_time = actions_queue[-1].client_ts
+        return event_time
+
+    def _get_updates_queue_event_time(self, updates_queue):
+        if not updates_queue:
+            event_time = math.inf
+        else:
+            update = updates_queue.get()
+            if type(update) == MdUpdate:
+                if update.orderbook is not None:
+                    event_time = update.orderbook.receive_ts
+                elif update.trade is not None:
+                    event_time = update.trade.receive_ts
+            elif type(update) == Order or type(update) == CancelOrder or type(update) == OwnTrade:
+                event_time = update.receive_ts
+        return event_time
+
 
     def _execute_orders(self):
         pass
@@ -329,11 +404,12 @@ class ExchangeSimulator:
             order: `Order` object. The following attributes MUST be initalized:
             `client_ts`, `side`, `size`, `price`.
         """
-        self.actions_queue.append(order)
+        self.actions.append(order)
 
     def cancel_order(self, order_id):
         """Cancel order by ID.
-        :param order_id: order ID assigned by the exchange when the order was placed
+        Args:
+            order_id: order ID assigned by the exchange when the order was placed
         """
         pass
 
