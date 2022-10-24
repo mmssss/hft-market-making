@@ -43,7 +43,6 @@ class Order:
             Unique ID assigned by client. Can be used to immediately keep track of the order.
     """
     client_ts: int
-    # status: str
     side: str
     size: float
     price: float
@@ -238,7 +237,8 @@ class Strategy:
             max_position:
                 Maximum allowed absolute value of position size at any given moment.
             order_lifetime:
-                How much time (in nanoseconds) an unfilled order stays active before being canceled.
+                How much time (in nanoseconds) an unfilled order stays active
+                before being canceled.
         """
         self.sim: 'ExchangeSimulator' = sim
         # TODO: implement max_postition restriction
@@ -368,7 +368,7 @@ def load_md_from_files(lobs_path: str, trades_path: str,
     trades = pd.read_csv(os.path.join(trades_path))
     print('Creating a list of MdUpdate objects...', end=' ')
 
-    # TODO: remove to_datetime after debugging
+    # TODO: remove `to_datetime` after debugging
     lobs['receive_ts'] = pd.to_datetime(lobs['receive_ts'])
     trades['receive_ts'] = pd.to_datetime(trades['receive_ts'])
     lobs['exchange_ts'] = pd.to_datetime(lobs['exchange_ts'])
