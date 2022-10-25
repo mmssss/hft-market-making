@@ -2,5 +2,6 @@
 **/.ipynb_checkpoints
 __pycache__
 
+/simulator/logs/*.log
 /data
 scratch.ipynb

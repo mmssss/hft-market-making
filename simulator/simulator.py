@@ -3,6 +3,8 @@ import math
 import copy
 import heapq
 import random
+import datetime
+import pathlib
 from enum import IntEnum
 from dataclasses import dataclass
 from typing import Optional, Union, Dict, List, Tuple, Deque
@@ -74,7 +76,8 @@ class OrderCancel:
     """Information about order cancellation.
 
     Non-optional attributes must not be `None`, otherwise `ValueError` is raised.
-    Either `client_order_id` or `order_id` must be provided.
+    Either `client_order_id` or `order_id` must be provided. If both are provided,
+    `order_id` takes precedence.
 
     Attributes:
         client_ts:
@@ -229,38 +232,53 @@ class MdUpdate:
 
 
 class Strategy:
+    LOGS_DIR = pathlib.Path('logs')
+
     def __init__(self, sim: 'ExchangeSimulator', max_position: float, order_lifetime: int) -> None:
         """
         Args:
             sim:
                 Exchange simulator object.
             max_position:
-                Maximum allowed absolute value of position size at any given moment.
+                Maximum allowed absolute value of position size in quote asset
+                at any given moment.
             order_lifetime:
                 How much time (in nanoseconds) an unfilled order stays active
                 before being canceled.
         """
         self.sim: 'ExchangeSimulator' = sim
-        # TODO: implement max_postition restriction
         self.max_position: float = max_position
         self.order_lifetime: int = order_lifetime
 
-        # Current client time (in nanoseconds). Upon receiving a new update from the simulator,
-        # it is set to `receive_ts` of the update.
+        # Current client time (in nanoseconds).
+        # Upon receiving a new update from the simulator, it is set to `receive_ts` of the update.
         self.current_time: Optional[int] = None
         # Local version of the order book
         self.orderbook: Optional[OrderbookSnapshotUpdate] = None
         # Client ID that will be assigned to the next created order
         self.client_order_id: int = 1
         # Client version of active orders dictionary. Key: client_order_id, Value: Order.
-        self.active_orders: Dict[int, Order] = {}
+        self.active_orders: OrderedDict[int, Order] = OrderedDict()
+        # TODO: implement pending orders
+        # When client send place order request to the exchange simulator,
+        # orders are moved here until the response confirms the placement
+        self.pending_orders: OrderedDict[int, Order] = OrderedDict()
+        # Current position size in quote asset
+        self.position_size_quote: float = 0
+        # Strategy log file
+        time_str = datetime.datetime.now().strftime('%d.%m.%Y-%H:%M:%S')
+        log_filename = f'strategy-{time_str}.log'
+        self.log = open(Strategy.LOGS_DIR / log_filename, 'w')
 
     def run(self) -> None:
         print('Running the strategy...')
         while True:
             update = self.sim.tick()
+            self.log.write(str(update) + '\n')
+
             if update is None:
-                print('Done')
+                print('\nDone.')
+                self.log.close()
                 break
 
             if type(update) == MdUpdate:
@@ -274,39 +292,51 @@ class Strategy:
                 if self.orderbook is None:
                     continue
 
-                side = random.choice(['BID', 'ASK'])
-                if side == 'BID':
-                    order_best_bid = Order(
-                        client_ts=self.current_time + 20, client_order_id=self.next_order_id(),
-                        side='BID', size=0.001, price=self.orderbook.bids[0][0])
-                    self.place_order(order_best_bid)
-                else:
-                    order_best_ask = Order(
-                        client_ts=self.current_time + 20, client_order_id=self.next_order_id(),
-                        side='ASK', size=0.001, price=self.orderbook.asks[0][0])
-                    self.place_order(order_best_ask)
+                if abs(self.position_size_quote) <= self.max_position:
+                    side = random.choice(['BID', 'ASK'])
+                    if side == 'BID':
+                        order_best_bid = Order(
+                            client_ts=self.current_time + 20, client_order_id=self.next_order_id(),
+                            side='BID', size=0.01, price=self.orderbook.bids[0][0])
+                        self.place_order(order_best_bid)
+                    else:
+                        order_best_ask = Order(
+                            client_ts=self.current_time + 20, client_order_id=self.next_order_id(),
+                            side='ASK', size=0.01, price=self.orderbook.asks[0][0])
+                        self.place_order(order_best_ask)
 
             elif type(update) == OwnTrade:
-                self.active_orders.pop(update.client_order_id)
+                own_trade = update
+                self.current_time = own_trade.receive_ts
+                if own_trade.client_order_id in self.active_orders:
+                    self.active_orders.pop(own_trade.client_order_id)
+                if own_trade.side == 'BID':
+                    self.position_size_quote += own_trade.size * own_trade.price
+                else:
+                    self.position_size_quote -= own_trade.size * own_trade.price
 
             elif type(update) == ActionResponse:
                 response = update
+                self.current_time = response.action.receive_ts
                 if type(response.action) == Order:
                     order = response.action
                     if response.code == ResponseCode.OK:
                         self.active_orders[order.client_order_id] = order
                 if type(response.action) == OrderCancel:
-                    cancel = response.action
-                    if response.code == ResponseCode.OK:
-                        self.active_orders.pop(cancel.client_order_id)
+                    pass
 
-            for order in self.active_orders.values():
+            # Cancel orders that are too old
+            to_cancel = []
+            for key, order in self.active_orders.items():
                 if self.current_time - order.client_ts > self.order_lifetime:
-                    order_cancel = OrderCancel(self.current_time, order_id=order.order_id,
-                                               client_order_id=order.client_order_id)
-                    self.sim.cancel_order(order_cancel)
-                    # no need to manually remove the order from `self.active_orders`, because
-                    # we do it after receiving `OrderCancel` or `OwnTrade` from the simulator
+                    to_cancel.append(key)
+                else:
+                    break
+            for key in to_cancel:
+                order = self.active_orders.pop(key)
+                order_cancel = OrderCancel(self.current_time, order_id=order.order_id,
+                                           client_order_id=order.client_order_id)
+                self.sim.cancel_order(order_cancel)
 
     def place_order(self, order: Order):
         self.active_orders[order.client_order_id] = order
@@ -404,15 +434,16 @@ def load_md_from_files(lobs_path: str, trades_path: str,
                     asks.append((lobs[i][k], lobs[i][k+1]))
                     bids.append((lobs[i][k+2], lobs[i][k+3]))
                 orderbook = OrderbookSnapshotUpdate(
-                    receive_ts=lobs_ts[i][0], exchange_ts=lobs_ts[i][1], asks=asks, bids=bids)
+                    exchange_ts=lobs_ts[i][1], receive_ts=lobs_ts[i][0], asks=asks, bids=bids)
                 i += 1
             # compare receive_ts
             elif trades_ts[j][0] <= lobs_ts[i][0]:
-                trade = AnonTrade(trades_ts[j][0], trades_ts[j][1], trades[j][0], trades[j][2], trades[j][1])
+                trade = AnonTrade(exchange_ts=trades_ts[j][1], receive_ts=trades_ts[j][0],
+                                  side=trades[j][0], size=trades[j][2], price=trades[j][1])
                 j += 1
             market_data.append(MdUpdate(orderbook, trade))
             progress_bar.update(1)
-    print('Done.')
+    print()
     return market_data
 
 
@@ -437,7 +468,7 @@ class ExchangeSimulator:
 
     def __init__(self, lobs_path: str, trades_path: str,
                  exec_latency: int, updates_latency: int,
-                 account_size: float, maker_fee: float, taker_fee: float,
+                 account_size: float, fee: float,
                  min_ts: Optional[pd.Timestamp] = None,
                  max_ts: Optional[pd.Timestamp] = None) -> None:
         """
@@ -455,10 +486,8 @@ class ExchangeSimulator:
                 the simulator.
             account_size:
                 Account size in quote asset.
-            maker_fee:
-                Maker fee (a fraction, not percent).
-            taker_fee:
-                Taker fee (a fraction, not percent).
+            fee:
+                Maker/taker fee (a fraction, not percent).
             min_ts:
                 Passed to marked data loader function `load_md_from_files`.
             max_ts:
@@ -473,10 +502,22 @@ class ExchangeSimulator:
 
         self.exec_latency = exec_latency
         self.updates_latency = updates_latency
-        # TODO: implement account_size handling
         self.account_size = account_size
-        self.maker_fee = maker_fee
-        self.taker_fee = taker_fee
+        # TODO: implement separate maker and taker fees
+        self.fee = fee
+
+        # Current exchange time (in nanoseconds).
+        # Every tick it is set to the smallest event time of three queues:
+        # market data, strategy actions, strategy updates
+        self.current_time: int = 0
+        # Current position size of a client (in base asset)
+        self.position_size: float = 0
+        # Amount of quote asset that is frozen by open buy orders
+        self.frozen_account: float = 0
+        # Amount of base asset that is frozen by open sell orders
+        self.frozen_position: float = 0
+        # Total value (in quote asset) of the portfolio for every tick
+        self.value_history: List[float] = []
         # Current exchange time (in nanoseconds)
         # Market data deqeue. Elements should be popped from the left.
         self.md: deque[MdUpdate] = load_md_from_files(lobs_path, trades_path, min_ts, max_ts)
@@ -501,15 +542,16 @@ class ExchangeSimulator:
         # The dictionary of used client order IDs.
         # Key: client_order_id, Value: `True` if this ID has already been used, `False` otherwise
         self.used_client_ids: Dict[int, bool] = dict()
-        # Dict for all active client orders. Key: pair (order_id, client_order_id), Value: Order.
-        # TODO: implement the ability to find orders using either
-        #  order_id or client_order_id, instead of using both.
+        # Dictionary for all active client orders.
+        # Key: tuple(0, order_id) or tuple(1, client_order_id). Value: `Order` object.
+        # Such key structure allow to, for example, cancel the order using either
+        # its order_id or client_order_id.
         self.active_orders: Dict[(int, int), Order] = dict()
         # Dict's for active client orders on bid/ask sides, sorted by price.
         # Key: price. Value: another dict, used to store orders.
         # OrderedDict is used to pop elements with `popitem` in FIFO order.
-        # This ordered dict contains elements as follows.
-        # Key: pair (order_id, client_order_id). Value: Order.
+        #     This ordered dict contains elements as follows.
+        #     Key: tuple(0, order_id) or tuple(1, client_order_id). Value: `Order` object.
         self.active_orders_ask: SortedDict[int, OrderedDict[(int, int), Order]] = SortedDict()
         self.active_orders_bid: SortedDict[int, OrderedDict[(int, int), Order]] = SortedDict()
         # Whether method `tick` was called during this simulation
@@ -540,16 +582,23 @@ class ExchangeSimulator:
             md_et = self._get_md_event_time()
             actions_et = self._get_actions_event_time()
             updates_et = self._get_strat_updates_event_time()
-            if md_et == math.inf and actions_et == math.inf and updates_et == math.inf:
+            # TODO: (4) come back to float after debugging
+            # if md_et == math.inf and actions_et == math.inf and updates_et == math.inf:
+            if md_et == pd.Timestamp(2524608000000000000) \
+                    and actions_et == pd.Timestamp(2524608000000000000) \
+                    and updates_et == pd.Timestamp(2524608000000000000):
+
                 return None
 
             # Return an update to the strategy
             if updates_et < md_et and updates_et < actions_et:
+                self.current_time = updates_et
                 update = heapq.heappop(self.strategy_updates)[-1]
                 return update
 
             # Apply an update from market data queue
             elif md_et <= updates_et and md_et <= actions_et:
+                self.current_time = md_et
                 md_update = self.md.popleft()
                 self.progress_bar.update(1)
                 if md_update.orderbook is not None:
@@ -559,7 +608,7 @@ class ExchangeSimulator:
                 elif md_update.trade is not None:
                     if md_update.trade.side == 'BID':
                         self.best_ask = md_update.trade.price
-                    else:  # ASK
+                    else:
                         self.best_bid = md_update.trade.price
                     receive_ts = md_update.trade.receive_ts
                 self._push_strategy_update(receive_ts, md_update)
@@ -567,42 +616,88 @@ class ExchangeSimulator:
 
             # Apply an update from actions queue.
             elif actions_et <= updates_et and actions_et <= md_et:
+                self.current_time = actions_et
                 action = self.actions.popleft()
+                # Place order action has waited the execution latency
                 if type(action) == Order:
                     order = action
-                    order.order_id = self._next_order_id()
-                    if order.client_order_id not in self.used_client_ids:
-                        self.used_client_ids[order.client_order_id] = True
+                    # Check if current account size is sufficient to create the order
+                    quote_size = order.size * order.price
+                    if order.side == 'BID':
+                        if quote_size <= self.account_size:
+                            self.account_size -= quote_size
+                            self.frozen_account += quote_size
+                        else:
+                            self._push_action_response(order, ResponseCode.PLACE_ORDER_INSUFFICIENT_BALANCE)
+                            continue
                     else:
-                        raise RuntimeError(f'Client order id {order.client_order_id} has already been used')
+                        # TODO: (1) maybe freeze a part of the position when selling and check if balance
+                        #  is sufficient, while taking short-selling into consideration
+                        pass
+                    # If balance is enough, finalize the order
+                    order.order_id = self._next_order_id()
                     if order.side == 'BID':
                         orders = self.active_orders_bid.setdefault(order.price, OrderedDict())
                     else:
                         orders = self.active_orders_ask.setdefault(order.price, OrderedDict())
-                    orders[(order.order_id, order.client_order_id)] = order
-                    self.active_orders[(order.order_id, order.client_order_id)] = order
+                    # use `order_id` as key
+                    orders[(0, order.order_id)] = order
+                    self.active_orders[(0, order.order_id)] = order
+                    # use `client_order_id` as key
+                    if order.client_order_id is not None:
+                        if order.client_order_id not in self.used_client_ids:
+                            self.used_client_ids[order.client_order_id] = True
+                            orders[(1, order.client_order_id)] = order
+                            self.active_orders[(1, order.client_order_id)] = order
+                        else:
+                            raise RuntimeError(f'Client order id {order.client_order_id} has already been used')
                     self._push_action_response(order, ResponseCode.OK)
+
+                # Cancel order action has waited the execution latency
                 elif type(action) == OrderCancel:
                     cancel = action
-                    key = (cancel.order_id, cancel.client_order_id)
-                    if key in self.active_orders:
-                        order = self.active_orders.pop(key)
-                        if order.side == 'BID' and key in self.active_orders_bid[order.price]:
-                            self.active_orders_bid[order.price].pop(key)
-                            self._push_action_response(cancel, ResponseCode.OK)
-                        elif order.side == 'ASK' and key in self.active_orders_ask[order.price]:
-                            self.active_orders_ask[order.price].pop(key)
-                            self._push_action_response(cancel, ResponseCode.OK)
+                    if cancel.order_id is not None:
+                        key1 = (0, cancel.order_id)
+                        if key1 in self.active_orders:
+                            key2 = (1, self.active_orders[key1].client_order_id)
                         else:
-                            # TODO: implement returning error if order was not found
-                            # self._push_action_response(cancel, ResponseCode.CANCEL_ORDER_ID_NOT_FOUND)
-                            pass
+                            self._push_action_response(cancel, ResponseCode.CANCEL_ORDER_ID_NOT_FOUND)
+                            continue
+                    elif cancel.client_order_id is not None:
+                        key1 = (1, cancel.client_order_id)
+                        if key1 in self.active_orders:
+                            key2 = (0, self.active_orders[key1].order_id)
+                        else:
+                            self._push_action_response(cancel, ResponseCode.CANCEL_ORDER_CLIENT_ID_NOT_FOUND)
+                            continue
+                    else:
+                        raise RuntimeError('Either `client_order_id` or `order_id` must '
+                                           'be provided in `OrderCancel` object')
+
+                    order = self.active_orders.pop(key1)
+                    if order.side == 'BID':
+                        quote_size = order.size * order.price
+                        self.frozen_account -= quote_size
+                        self.account_size += quote_size
+                        active_orders_bidask = self.active_orders_bid
+                    else:
+                        # TODO: (2) maybe freeze a part of the position when selling and check if balance
+                        #  is sufficient, while taking short-selling into consideration
+                        active_orders_bidask = self.active_orders_ask
+                    active_orders_bidask[order.price].pop(key1)
+                    if key2 is not None and key2 != key1:
+                        active_orders_bidask[order.price].pop(key2)
+                        self.active_orders.pop(key2)
+                    self._push_action_response(cancel, ResponseCode.OK)
+            mid_price = (self.best_ask - self.best_bid) / 2
+            cur_value = self.account_size + self.position_size * mid_price
+            self.value_history.append(cur_value)
 
     def _get_md_event_time(self):
         # Calculates event time for market data queue.
         # It is equal to `exchange_ts` of the first element in the queue.
         if not self.md:
-            # TODO: come back to float after debugging (1)
+            # TODO: (1) come back to float after debugging
             event_time = pd.Timestamp('2050-01-01')
             # event_time = math.inf
         else:
@@ -617,7 +712,7 @@ class ExchangeSimulator:
         # Calculates event time for actions queue.
         # It is equal to `exchange_ts` of the first element in the cqueue.
         if not self.actions:
-            # TODO: come back to float after debugging (2)
+            # TODO: (2) come back to float after debugging
             event_time = pd.Timestamp('2050-01-01')
             # event_time = math.inf
         else:
@@ -628,7 +723,7 @@ class ExchangeSimulator:
         # Calculates event time for strategy updates queue.
         # It is equal to `receive_ts` of the first element in the queue.
         if not self.strategy_updates:
-            # TODO: come back to float after debugging (3)
+            # TODO: (3) come back to float after debugging
             event_time = pd.Timestamp('2050-01-01')
             # event_time = math.inf
         else:
@@ -650,12 +745,6 @@ class ExchangeSimulator:
         self.order_id += 1
         return cur_id
 
-    def _next_trade_id(self):
-        # Returns the next trade ID
-        cur_id = self.trade_id
-        self.trade_id += 1
-        return cur_id
-
     def _push_strategy_update(self, receive_ts, update: Union[MdUpdate, OwnTrade, ActionResponse]):
         self.strategy_updates_counter += 1
         heapq.heappush(self.strategy_updates, (receive_ts, self.strategy_updates_counter, update))
@@ -671,37 +760,55 @@ class ExchangeSimulator:
         for price in self.active_orders_ask:
             if price < self.best_bid:
                 while self.active_orders_ask[price]:
-                    # pop items in FIFO order
-                    _, order = self.active_orders_ask[price].popitem(last=False)
-                    self._execute_order(order)
-                    self.active_orders.pop((order.order_id, order.client_order_id))
+                    self._execute_orders_on_price_level(self.active_orders_ask, price)
             else:
                 break
         for price in reversed(self.active_orders_bid):
             if price > self.best_ask:
                 while self.active_orders_bid[price]:
-                    _, order = self.active_orders_bid[price].popitem(last=False)
-                    self._execute_order(order)
-                    self.active_orders.pop((order.order_id, order.client_order_id))
+                    self._execute_orders_on_price_level(self.active_orders_bid, price)
             else:
                 break
 
-    def _execute_order(self, order):
-        receive_ts = order.exchange_ts + self.updates_latency
+    def _execute_orders_on_price_level(self, active_orders_bidask, price):
+        # We know that the key is `order_id`, because we first add the element in the
+        # dictionary using `order_id` as the key.
+        _, order = active_orders_bidask[price].popitem(last=False)
+        if order.side == 'BID':
+            self.frozen_account -= order.size * order.price
+            self.position_size += (1 - self.fee) * order.size
+        else:
+            # TODO: (3) maybe freeze a part of the position when selling and check if balance
+            #  is sufficient, while taking short-selling into consideration
+            self.position_size -= order.size
+            self.account_size += order.size * order.price
+
+        self.active_orders.pop((0, order.order_id))
+        if order.client_order_id is not None:
+            active_orders_bidask[order.price].pop((1, order.client_order_id))
+            self.active_orders.pop((1, order.client_order_id))
+
+        receive_ts = self.current_time + self.updates_latency
         trade_id = self._next_trade_id()
-        trade = OwnTrade(order.exchange_ts, receive_ts, order.order_id,
+        trade = OwnTrade(self.current_time, receive_ts, order.order_id,
                          trade_id, order.side, order.size, order.price,
                          order.client_order_id)
         self._push_strategy_update(receive_ts, trade)
 
-    def place_order(self, order: 'Order'):
+    def _next_trade_id(self):
+        # Returns the next trade ID
+        cur_id = self.trade_id
+        self.trade_id += 1
+        return cur_id
+
+    def place_order(self, order: Order):
         """Places the order in exchange simulator, with latency emulation.
 
         A copy of passed `Order` object is created.
 
         Args:
             order:
-                `Order` object. See `Order` for information about mandatory attributes.
+                `Order` object. See `Order` for information about the attributes.
                 The same `client_order_id` can only be used once per simulation.
 
         Raises:
@@ -722,14 +829,14 @@ class ExchangeSimulator:
         order_copy.exchange_ts = order_copy.client_ts + self.exec_latency
         self.actions.append(order_copy)
 
-    def cancel_order(self, order_cancel: 'OrderCancel'):
+    def cancel_order(self, order_cancel: OrderCancel):
         """Cancels the order in exchange simulator, with latency emulation.
 
         A copy of passed `OrderCancel` object is created.
 
         Args:
             order_cancel:
-                `OrderCancel` object. See `OrderCancel` for information about mandatory attributes.
+                `OrderCancel` object. See `OrderCancel` for information about the attributes.
 
         Raises:
             RuntimeError:
@@ -742,14 +849,37 @@ class ExchangeSimulator:
         cancel_copy.exchange_ts = cancel_copy.client_ts + self.exec_latency
         self.actions.append(cancel_copy)
 
+    def get_value_history(self) -> List[float]:
+        """Returns the history of portfolio value.
+
+        Portfolio value is calculated as follows:
+        account_size + position_size * mid_price
+
+        Returns:
+            History of portfolio value for every tick.
+        """
+        return self.value_history
+
 
 if __name__ == "__main__":
     lobs_path = '../data/1/btcusdt:Binance:LinearPerpetual/lobs.csv'
     trades_path = '../data/1/btcusdt:Binance:LinearPerpetual/trades.csv'
 
-    sim = ExchangeSimulator(lobs_path, trades_path, exec_latency=10_000_000, updates_latency=10_000_000,
-                            account_size=10000, maker_fee=0.001, taker_fee=0.001,
-                            min_ts=None, max_ts=pd.Timestamp('2022-06-23 00:30:00'))
-    strategy = Strategy(sim, max_position=0.01, order_lifetime=1)
+    sim = ExchangeSimulator(lobs_path, trades_path,
+                            exec_latency=10_000_000, updates_latency=10_000_000,
+                            account_size=20000, fee=0.001,
+                            min_ts=None, max_ts=pd.Timestamp('2022-06-23 00:02:00'))
+    strategy = Strategy(sim, max_position=1000, order_lifetime=100_000_000)
     strategy.run()
+    value_history = sim.get_value_history()
 
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(value_history)
+    plt.title('Total portfolio value history')
+    plt.xlabel('Tick number')
+    plt.ylabel('Portfolio value')
+    time_str = datetime.datetime.now().strftime('%d.%m.%Y-%H:%M:%S')
+    plot_filename = f'strategy-{time_str}.png'
+    plt.savefig(f'plots/{plot_filename}')
+    plt.show()
