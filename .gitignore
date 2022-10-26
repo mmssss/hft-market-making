@@ -2,7 +2,10 @@
 **/.ipynb_checkpoints
 __pycache__
 
+/data
+
 /output/logs/*.log
 /output/plots/*.png
-/data
+!/output/plots/example-run.png
+
 scratch.ipynb
