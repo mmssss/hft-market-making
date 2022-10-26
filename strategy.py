@@ -55,7 +55,7 @@ class Strategy:
         self.log = open(Strategy.LOGS_DIR / log_filename, 'w')
 
     def run(self) -> None:
-        print('Running the strategy...')
+        print('Running the strategy...', flush=True)
         while True:
             update = self.sim.tick()
             if self.enable_log:
