@@ -415,7 +415,7 @@ class ExchangeSimulator:
         self.position_size: float = 0
         # Amount of quote asset that is frozen by open buy orders.
         self.frozen_account: float = 0
-        # Amount of base asset that is frozen by open sell orders.
+        # TODO: Amount of base asset that is frozen by open sell orders.
         self.frozen_position: float = 0
         # Total value (in quote asset) of the account for every tick.
         self.value_history: List[float] = []
@@ -531,7 +531,7 @@ class ExchangeSimulator:
                     order = action
                     # Check if current account size is sufficient to
                     # create the order
-                    quote_size = order.size * order.price
+                    quote_size = ((1 + self.fee) * order.size) * order.price
                     if order.side == 'BID':
                         if quote_size <= self.account_size:
                             self.account_size -= quote_size
@@ -542,9 +542,8 @@ class ExchangeSimulator:
                             continue
                     else:
                         # TODO: (1) maybe freeze a part of the position
-                        #  when selling and check if balance
-                        #  is sufficient, while taking short-selling
-                        #  into consideration
+                        #  when selling and check if it's sufficient,
+                        #  while taking short-selling into consideration
                         pass
                     # If balance is enough, finalize the order
                     order.order_id = self._next_order_id()
@@ -606,6 +605,7 @@ class ExchangeSimulator:
                         #  is sufficient, while taking short-selling
                         #  into consideration
                         active_orders_bidask = self.active_orders_ask
+                    # TODO: clean empty price levels
                     active_orders_bidask[order.price].pop(key1)
                     if key2 is not None and key2 != key1:
                         active_orders_bidask[order.price].pop(key2)
@@ -698,14 +698,14 @@ class ExchangeSimulator:
         # element in the dictionary using `order_id` as the key.
         _, order = active_orders_bidask[price].popitem(last=False)
         if order.side == 'BID':
-            self.frozen_account -= order.size * order.price
-            self.position_size += (1 - self.fee) * order.size
+            self.frozen_account -= ((1 + self.fee) * order.size) * order.price
+            self.position_size += order.size
         else:
             # TODO: (3) maybe freeze a part of the position when selling
             #  and check if balance is sufficient, while taking
             #  short-selling into consideration
             self.position_size -= order.size
-            self.account_size += order.size * order.price
+            self.account_size += (order.size * order.price) * (1 - self.fee)
 
         self.active_orders.pop((0, order.order_id))
         if order.client_order_id is not None:

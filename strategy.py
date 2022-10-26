@@ -50,9 +50,10 @@ class Strategy:
         # Current position size in quote asset
         self.position_size_quote: float = 0
         # Strategy log file
-        time_str = datetime.datetime.now().strftime('%d.%m.%Y-%H:%M:%S')
-        log_filename = f'strategy-{time_str}.log'
-        self.log = open(Strategy.LOGS_DIR / log_filename, 'w')
+        if self.enable_log:
+            time_str = datetime.datetime.now().strftime('%d.%m.%Y-%H:%M:%S')
+            log_filename = f'strategy-{time_str}.log'
+            self.log = open(Strategy.LOGS_DIR / log_filename, 'w')
 
     def run(self) -> None:
         print('Running the strategy...', flush=True)
