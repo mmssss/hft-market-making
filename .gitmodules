@@ -1,0 +1,4 @@
+[submodule "simulator_external"]
+	path = simulator_external
+	url = https://github.com/mmssss/dolmatovas-HFT
+	branch = mmssss

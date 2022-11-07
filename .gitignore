@@ -4,8 +4,8 @@ __pycache__
 
 /data
 
-/output/logs/*.log
-/output/plots/*.png
-!/output/plots/example-run.png
+/simulator/output/logs/*.log
+/simulator/output/plots/*.png
+!/simulator/output/plots/example-run.png
 
 scratch.ipynb
