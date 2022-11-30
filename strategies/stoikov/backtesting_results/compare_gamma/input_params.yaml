@@ -1,0 +1,21 @@
+Simulator parameters:
+  execution_latency: 10000000
+  md_latency: 10000000
+Strategy parameters:
+  gamma:
+  - 0.002
+  - 0.005
+  - 0.04
+  - 0.01
+  - 0.1
+  - 0.5
+  - 1
+  - 2
+  - 4
+  k: 0.8
+  sigma: 1
+  adjust_delay: 1000000
+  order_size: 0.001
+  min_order_size: 0.001
+  precision: 2
+Maker/taker fee: 0.0002
