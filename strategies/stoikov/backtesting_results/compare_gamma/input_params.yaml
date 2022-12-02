@@ -14,8 +14,9 @@ Strategy parameters:
   - 4
   k: 0.8
   sigma: 1
+  terminal_time: false
   adjust_delay: 1000000
   order_size: 0.001
   min_order_size: 0.001
   precision: 2
-Maker/taker fee: 0.0002
+Maker/taker fee: 0.0
